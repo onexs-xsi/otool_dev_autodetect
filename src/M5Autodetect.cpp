@@ -7,6 +7,8 @@
 #include <vector>
 
 #include "data/M5Autodetect_DeviceData.h"
+#include "data/M5Autodetect_PinPolicy.h"
+#include "esp_system.h"
 #include "platform/M5Autodetect_IdfI2C.h"
 
 #if __has_include(<esp_lcd_mipi_dsi.h>)
@@ -801,6 +803,7 @@ static void runPrerequisites(const std::vector<m5::autodetect::Prerequisite>& pr
 const m5::autodetect::DeviceInfo* M5Autodetect::detect() {
     String chipModel = ESP.getChipModel();
     const ChipKind chipKind = detectChipKind(chipModel);
+    const bool warm_reset=esp_reset_reason()!=ESP_RST_POWERON;
     const m5::autodetect::DeviceInfo* best_device = nullptr;
     int max_score = -1;
     int min_skip_count = 999;  // Lower is better (fewer skips = higher priority)
@@ -863,8 +866,14 @@ const m5::autodetect::DeviceInfo* M5Autodetect::detect() {
 
         // 2. IOMAP
         int pin_match_count = 0;
+        int pin_count=0, ignored_pins=0;
         for (const auto& pinCheck : device.check_pins) {
             if (pinCheck.gpio < 0) continue;
+            ++pin_count;
+            if (m5::autodetect::warmResetSdPin(device.board_id,warm_reset,pinCheck.gpio)) {
+                ++ignored_pins;
+                continue; // A warm SD card can still drive its data pins low.
+            }
 
             if (pinCheck.mode == 1) {
                 pinMode(pinCheck.gpio, INPUT_PULLUP);
@@ -883,9 +892,10 @@ const m5::autodetect::DeviceInfo* M5Autodetect::detect() {
                 if (_debug >= debug_debug) LOG_PRINTF(debug_debug, "  [Fail] Pin %d check failed. Expected %d, got %d\r\n", pinCheck.gpio, pinCheck.expect, val);
             }
         }
-        if (pin_match_count >= device.check_pins_count) {
+        const int required_pins=m5::autodetect::requiredIdentityPins(device.check_pins_count,pin_count,ignored_pins);
+        if (pin_match_count >= required_pins) {
             current_score++;
-            if (_debug >= debug_debug) LOG_PRINTF(debug_debug, "  [Pass] IOMAP Match (+1) (%d/%d)\r\n", pin_match_count, device.check_pins_count);
+            if (_debug >= debug_debug) LOG_PRINTF(debug_debug, "  [Pass] IOMAP Match (+1) (%d/%d; warm SD hints skipped=%d)\r\n", pin_match_count, required_pins,ignored_pins);
         } else {
             step_failed = true;
             if (_debug >= debug_debug) LOG_PRINTF(debug_debug, "  [Fail] IOMAP Match (%d/%d)\r\n", pin_match_count, device.check_pins_count);
@@ -1062,6 +1072,10 @@ const m5::autodetect::DeviceInfo* M5Autodetect::detect() {
                 current_score++;  // Still add score
                 skip_count++;     // But count as skip (lower priority)
                 if (_debug >= debug_debug) LOG_TEXT(debug_debug, "  [Skip] No I2C Comm to check (+1)\r\n");
+            }
+            if (ignored_pins && (i2c_comm_skipped || !i2c_comm_match || i2c_device_required_count==0)) {
+                step_failed=true;
+                if (_debug >= debug_debug) LOG_TEXT(debug_debug,"  [Fail] Warm SD pin policy requires actual mandatory I2C probes\r\n");
             }
         }
 
